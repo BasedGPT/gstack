@@ -118,7 +118,7 @@ interface PageRecord {
 }
 
 interface IngestState {
-  schema_version: 1;
+  schema_version: 2;
   last_writer: string;
   last_full_walk?: string;
   sessions: Record<
@@ -166,6 +166,10 @@ interface BulkResult {
 const HOME = homedir();
 const GSTACK_HOME = process.env.GSTACK_HOME || join(HOME, ".gstack");
 const STATE_PATH = join(GSTACK_HOME, ".transcript-ingest-state.json");
+// v2 invalidates entries written by the pre-modern-Codex parser. Those entries
+// could point at empty transcript pages while making the source look complete,
+// so a schema mismatch deliberately replays the source corpus.
+const STATE_SCHEMA_VERSION = 2;
 const DEFAULT_INCREMENTAL_BUDGET_MS = 50;
 
 const ALL_TYPES: MemoryType[] = [
@@ -264,7 +268,7 @@ function parseArgs(): CliArgs {
 function loadState(): IngestState {
   if (!existsSync(STATE_PATH)) {
     return {
-      schema_version: 1,
+      schema_version: STATE_SCHEMA_VERSION,
       last_writer: "gstack-memory-ingest",
       sessions: {},
     };
@@ -272,14 +276,14 @@ function loadState(): IngestState {
   try {
     const raw = readFileSync(STATE_PATH, "utf-8");
     const parsed = JSON.parse(raw) as IngestState;
-    if (parsed.schema_version !== 1) {
+    if (parsed.schema_version !== STATE_SCHEMA_VERSION) {
       console.error(`State file at ${STATE_PATH} has unknown schema_version ${parsed.schema_version}; backing up + resetting.`);
       try {
         writeFileSync(STATE_PATH + ".bak", raw, "utf-8");
       } catch {
         // backup failure is non-fatal
       }
-      return { schema_version: 1, last_writer: "gstack-memory-ingest", sessions: {} };
+      return { schema_version: STATE_SCHEMA_VERSION, last_writer: "gstack-memory-ingest", sessions: {} };
     }
     return parsed;
   } catch (err) {
@@ -290,7 +294,7 @@ function loadState(): IngestState {
     } catch {
       // best-effort
     }
-    return { schema_version: 1, last_writer: "gstack-memory-ingest", sessions: {} };
+    return { schema_version: STATE_SCHEMA_VERSION, last_writer: "gstack-memory-ingest", sessions: {} };
   }
 }
 
@@ -548,7 +552,7 @@ interface ParsedSession {
 // rollout would resurface later as trusted memory content.
 const INGESTIBLE_ROLES = new Set(["user", "assistant"]);
 
-function parseTranscriptJsonl(path: string): ParsedSession | null {
+export function parseTranscriptJsonl(path: string): ParsedSession | null {
   // Best-effort tolerant parser. Handles truncated last lines (D10 partial-flag).
   let raw: string;
   try {
@@ -626,7 +630,8 @@ function parseTranscriptJsonl(path: string): ParsedSession | null {
     } else if (isCodex && rec?.payload?.message) {
       // Legacy Codex shape: each record has payload.message
       const msg = rec.payload.message;
-      const role = (msg.role || "user").toLowerCase();
+      if (typeof msg.role !== "string") continue;
+      const role = msg.role;
       if (!INGESTIBLE_ROLES.has(role)) continue; // skip developer/system instructions
       const content = extractContentText(msg);
       if (content) {
@@ -636,7 +641,8 @@ function parseTranscriptJsonl(path: string): ParsedSession | null {
     } else if (isCodex && rec?.payload?.type === "message") {
       // Current Codex rollout shape: a `response_item` record carries
       // payload.{role, content[]} directly, with no payload.message wrapper.
-      const role = (rec.payload.role || "user").toLowerCase();
+      if (typeof rec.payload.role !== "string") continue;
+      const role = rec.payload.role;
       if (!INGESTIBLE_ROLES.has(role)) continue; // skip developer/system instructions
       const content = extractContentText(rec.payload);
       if (content) {
@@ -645,6 +651,11 @@ function parseTranscriptJsonl(path: string): ParsedSession | null {
       }
     }
   }
+
+  // A transcript page with no user/assistant turns is not useful memory. More
+  // importantly, returning it would let the caller state-stamp a parser miss
+  // and suppress retries after a future format fix.
+  if (messageCount === 0) return null;
 
   const body = bodyParts.join("\n\n").slice(0, 200000); // hard cap 200KB
 
@@ -964,6 +975,81 @@ interface ImportJsonResult {
   errors?: number;
   chunks?: number;
   total_files?: number;
+  failures?: unknown;
+}
+
+interface StructuredFailureResolution {
+  /** False means the older GBrain payload omitted `failures`; use the ledger. */
+  available: boolean;
+  failedSources: Set<string>;
+  error?: string;
+}
+
+/**
+ * Resolve GBrain's structured `import --json` failures back to source files.
+ *
+ * Current GBrain emits `failures: [{ path, error }]`, where path is relative
+ * to the import staging directory. When the field is present it is
+ * authoritative: malformed entries, paths absent from our staging map, or an
+ * `errors` count larger than the path list mean we cannot prove which source
+ * files landed. The caller must then fail closed and advance no state.
+ *
+ * Older GBrain versions omit the field. `available: false` preserves the
+ * existing sync-failures.jsonl compatibility path for those versions.
+ */
+export function resolveStructuredImportFailures(
+  importJson: ImportJsonResult,
+  stagedPathToSource: Map<string, string>,
+): StructuredFailureResolution {
+  if (!("failures" in importJson)) {
+    return { available: false, failedSources: new Set() };
+  }
+  if (!Array.isArray(importJson.failures)) {
+    return {
+      available: true,
+      failedSources: new Set(),
+      error: "gbrain import --json reported a non-array failures field",
+    };
+  }
+
+  const failedSources = new Set<string>();
+  for (const [index, failure] of importJson.failures.entries()) {
+    if (
+      typeof failure !== "object"
+      || failure === null
+      || typeof (failure as { path?: unknown }).path !== "string"
+      || (failure as { path: string }).path.length === 0
+    ) {
+      return {
+        available: true,
+        failedSources: new Set(),
+        error: `gbrain import --json failure ${index} has no explicit path`,
+      };
+    }
+    const reportedPath = (failure as { path: string }).path.replace(/\\/g, "/").replace(/^\.\//, "");
+    const source = stagedPathToSource.get(reportedPath);
+    if (!source) {
+      return {
+        available: true,
+        failedSources: new Set(),
+        error: `gbrain import --json failure path could not be mapped: ${reportedPath}`,
+      };
+    }
+    failedSources.add(source);
+  }
+
+  if (
+    typeof importJson.errors === "number"
+    && importJson.errors > importJson.failures.length
+  ) {
+    return {
+      available: true,
+      failedSources: new Set(),
+      error: `gbrain import --json reported ${importJson.errors} errors but only ${importJson.failures.length} failure paths`,
+    };
+  }
+
+  return { available: true, failedSources };
 }
 
 /**
@@ -1821,13 +1907,34 @@ async function ingestPass(args: CliArgs): Promise<BulkResult> {
       };
     }
 
-    // D7: identify which staged files failed to import and exclude them
-    // from state recording. Source paths get a retry on the next run.
-    const failedSources = readNewFailures(
-      syncFailuresPath,
-      preImportOffset,
+    // Prefer GBrain's structured per-file failures. Older versions omit the
+    // field, so retain the JSONL ledger as a compatibility fallback.
+    const structuredFailures = resolveStructuredImportFailures(
+      importJson,
       staging.stagedPathToSource,
     );
+    if (structuredFailures.error) {
+      const msg = `${structuredFailures.error}. Refusing to advance state.`;
+      console.error(`[memory-ingest] ERR: ${msg}`);
+      failed += prep.prepared.length;
+      return {
+        written: 0,
+        skipped_secret: prep.skippedSecret,
+        skipped_dedup: prep.skippedDedup,
+        skipped_unattributed: prep.skippedUnattributed,
+        failed,
+        duration_ms: Date.now() - t0,
+        partial_pages: prep.partialPages,
+        system_error: msg,
+      };
+    }
+    const failedSources = structuredFailures.available
+      ? structuredFailures.failedSources
+      : readNewFailures(
+          syncFailuresPath,
+          preImportOffset,
+          staging.stagedPathToSource,
+        );
     failed += failedSources.size;
 
     // Phase 3: state recording. Only files that landed in gbrain get

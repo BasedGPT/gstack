@@ -17,8 +17,12 @@
 import { describe, it, expect, beforeEach, afterEach } from "bun:test";
 import { mkdtempSync, writeFileSync, readFileSync, existsSync, rmSync, mkdirSync, statSync, chmodSync } from "fs";
 import { tmpdir } from "os";
-import { join } from "path";
+import { delimiter, join } from "path";
 import { spawnSync } from "child_process";
+import {
+  parseTranscriptJsonl,
+  resolveStructuredImportFailures,
+} from "../bin/gstack-memory-ingest.ts";
 
 const SCRIPT = join(import.meta.dir, "..", "bin", "gstack-memory-ingest.ts");
 
@@ -29,10 +33,14 @@ function makeTestHome(): string {
 }
 
 function runScript(args: string[], env: Record<string, string> = {}): { stdout: string; stderr: string; exitCode: number } {
+  const childEnv = { ...process.env, ...env };
+  // os.homedir() reads USERPROFILE on Windows, not HOME. Keep the test corpus
+  // hermetic instead of accidentally walking the operator's live transcripts.
+  if (env.HOME && process.platform === "win32") childEnv.USERPROFILE = env.HOME;
   const result = spawnSync("bun", [SCRIPT, ...args], {
     encoding: "utf-8",
     timeout: 30000,
-    env: { ...process.env, ...env },
+    env: childEnv,
   });
   return {
     stdout: result.stdout || "",
@@ -56,6 +64,28 @@ function writeCodexSession(home: string, ymd: string, content: string): string {
   const file = join(dir, `rollout-${Date.now()}.jsonl`);
   writeFileSync(file, content, "utf-8");
   return file;
+}
+
+function installPortableJsonGbrain(home: string, importJson: unknown): string {
+  const binDir = join(home, "portable-fake-bin");
+  mkdirSync(binDir, { recursive: true });
+  const implementation = join(binDir, "fake-gbrain.ts");
+  writeFileSync(
+    implementation,
+    `const args = process.argv.slice(2);\n` +
+      `if (args[0] === "--help" || args[0] === "-h") { console.log("Commands:\\n  import <dir>  Import"); process.exit(0); }\n` +
+      `if (args[0] === "import") { console.log(${JSON.stringify(JSON.stringify(importJson))}); process.exit(0); }\n` +
+      `process.exit(2);\n`,
+    "utf-8",
+  );
+  if (process.platform === "win32") {
+    writeFileSync(join(binDir, "gbrain.cmd"), `@echo off\r\nbun "%~dp0fake-gbrain.ts" %*\r\n`, "utf-8");
+  } else {
+    const launcher = join(binDir, "gbrain");
+    writeFileSync(launcher, `#!/usr/bin/env bash\nexec bun "$(dirname "$0")/fake-gbrain.ts" "$@"\n`, "utf-8");
+    chmodSync(launcher, 0o755);
+  }
+  return binDir;
 }
 
 // ── --help and --probe ─────────────────────────────────────────────────────
@@ -161,7 +191,7 @@ describe("gstack-memory-ingest CLI", () => {
 // ── State file behavior ────────────────────────────────────────────────────
 
 describe("gstack-memory-ingest state file", () => {
-  it("--incremental on empty home creates state file with schema_version: 1", () => {
+  it("--incremental on empty home creates state file with schema_version: 2", () => {
     const home = makeTestHome();
     const gstackHome = join(home, ".gstack");
     mkdirSync(gstackHome, { recursive: true });
@@ -170,24 +200,30 @@ describe("gstack-memory-ingest state file", () => {
     const statePath = join(gstackHome, ".transcript-ingest-state.json");
     expect(existsSync(statePath)).toBe(true);
     const state = JSON.parse(readFileSync(statePath, "utf-8"));
-    expect(state.schema_version).toBe(1);
+    expect(state.schema_version).toBe(2);
     expect(state.last_writer).toBe("gstack-memory-ingest");
     rmSync(home, { recursive: true, force: true });
   });
 
-  it("backs up state file on schema_version mismatch", () => {
+  it("backs up and resets parser-era schema_version 1 state", () => {
     const home = makeTestHome();
     const gstackHome = join(home, ".gstack");
     mkdirSync(gstackHome, { recursive: true });
     const statePath = join(gstackHome, ".transcript-ingest-state.json");
-    writeFileSync(statePath, JSON.stringify({ schema_version: 999, sessions: {} }), "utf-8");
+    const oldState = {
+      schema_version: 1,
+      sessions: { "old-codex.jsonl": { sha256: "old-parser-entry" } },
+    };
+    writeFileSync(statePath, JSON.stringify(oldState), "utf-8");
 
     const r = runScript(["--incremental", "--quiet"], { HOME: home, GSTACK_HOME: gstackHome });
     expect(r.exitCode).toBe(0);
     expect(existsSync(statePath + ".bak")).toBe(true);
 
+    expect(JSON.parse(readFileSync(statePath + ".bak", "utf-8"))).toEqual(oldState);
     const fresh = JSON.parse(readFileSync(statePath, "utf-8"));
-    expect(fresh.schema_version).toBe(1);
+    expect(fresh.schema_version).toBe(2);
+    expect(fresh.sessions).toEqual({});
     rmSync(home, { recursive: true, force: true });
   });
 
@@ -201,6 +237,164 @@ describe("gstack-memory-ingest state file", () => {
     const r = runScript(["--incremental", "--quiet"], { HOME: home, GSTACK_HOME: gstackHome });
     expect(r.exitCode).toBe(0);
     expect(existsSync(statePath + ".bak")).toBe(true);
+    rmSync(home, { recursive: true, force: true });
+  });
+});
+
+// ── Codex role + empty-session boundaries ─────────────────────────────────
+
+describe("gstack-memory-ingest Codex role boundary", () => {
+  it("requires an explicit user/assistant string role in current response_item records", () => {
+    const dir = mkdtempSync(join(tmpdir(), "gstack-mi-codex-role-current-"));
+    const file = join(dir, "current.jsonl");
+    writeFileSync(
+      file,
+      [
+        JSON.stringify({ type: "session_meta", payload: { id: "current", cwd: "/tmp/current" } }),
+        JSON.stringify({ type: "response_item", payload: { type: "message", content: [{ text: "missing role" }] } }),
+        JSON.stringify({ type: "response_item", payload: { type: "message", role: 7, content: [{ text: "numeric role" }] } }),
+        JSON.stringify({ type: "response_item", payload: { type: "message", role: "User", content: [{ text: "wrong-case role" }] } }),
+        JSON.stringify({ type: "response_item", payload: { type: "message", role: "developer", content: [{ text: "developer role" }] } }),
+      ].join("\n") + "\n",
+      "utf-8",
+    );
+
+    expect(parseTranscriptJsonl(file)).toBeNull();
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("requires an explicit user/assistant string role in legacy payload.message records", () => {
+    const dir = mkdtempSync(join(tmpdir(), "gstack-mi-codex-role-legacy-"));
+    const file = join(dir, "legacy.jsonl");
+    writeFileSync(
+      file,
+      [
+        JSON.stringify({ type: "session_meta", payload: { id: "legacy", cwd: "/tmp/legacy" } }),
+        JSON.stringify({ type: "event_msg", payload: { message: { content: "missing role" } } }),
+        JSON.stringify({ type: "event_msg", payload: { message: { role: {}, content: "object role" } } }),
+        JSON.stringify({ type: "event_msg", payload: { message: { role: "Assistant", content: "wrong-case role" } } }),
+        JSON.stringify({ type: "event_msg", payload: { message: { role: "system", content: "system role" } } }),
+      ].join("\n") + "\n",
+      "utf-8",
+    );
+
+    expect(parseTranscriptJsonl(file)).toBeNull();
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("does not state-stamp a zero-message Codex transcript", () => {
+    const home = makeTestHome();
+    const gstackHome = join(home, ".gstack");
+    mkdirSync(gstackHome, { recursive: true });
+    const today = new Date();
+    const ymd = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, "0")}-${String(today.getDate()).padStart(2, "0")}`;
+    writeCodexSession(
+      home,
+      ymd,
+      JSON.stringify({ type: "session_meta", payload: { id: "zero", cwd: "/tmp/zero" } }) + "\n" +
+        JSON.stringify({ type: "response_item", payload: { type: "message", content: [{ text: "no role" }] } }) + "\n",
+    );
+
+    const r = runScript(["--bulk", "--include-unattributed", "--no-write", "--quiet"], {
+      HOME: home,
+      GSTACK_HOME: gstackHome,
+    });
+    expect(r.exitCode).toBe(0);
+    const state = JSON.parse(readFileSync(join(gstackHome, ".transcript-ingest-state.json"), "utf-8"));
+    expect(state.schema_version).toBe(2);
+    expect(state.sessions).toEqual({});
+    expect(r.stdout).toMatch(/written:\s+0/);
+    expect(r.stdout).toMatch(/failed:\s+1/);
+    rmSync(home, { recursive: true, force: true });
+  });
+});
+
+describe("gstack-memory-ingest structured GBrain failures", () => {
+  const staged = new Map([
+    ["transcripts/codex/a.md", "C:/source/a.jsonl"],
+    ["transcripts/codex/b.md", "C:/source/b.jsonl"],
+  ]);
+
+  it("maps structured failure paths and normalizes GBrain path separators", () => {
+    const result = resolveStructuredImportFailures(
+      {
+        imported: 1,
+        errors: 1,
+        failures: [{ path: ".\\transcripts\\codex\\b.md", error: "invalid page" }],
+      },
+      staged,
+    );
+    expect(result.available).toBe(true);
+    expect(result.error).toBeUndefined();
+    expect([...result.failedSources]).toEqual(["C:/source/b.jsonl"]);
+  });
+
+  it("uses the legacy failure ledger only when the structured field is absent", () => {
+    const result = resolveStructuredImportFailures({ imported: 2, errors: 0 }, staged);
+    expect(result.available).toBe(false);
+    expect(result.failedSources.size).toBe(0);
+    expect(result.error).toBeUndefined();
+  });
+
+  it("fails closed when a structured failure path cannot be mapped", () => {
+    const result = resolveStructuredImportFailures(
+      { imported: 1, errors: 1, failures: [{ path: "transcripts/codex/missing.md", error: "bad" }] },
+      staged,
+    );
+    expect(result.available).toBe(true);
+    expect(result.failedSources.size).toBe(0);
+    expect(result.error).toContain("could not be mapped");
+  });
+
+  it("fails closed when the JSON error count exceeds its failure paths", () => {
+    const result = resolveStructuredImportFailures(
+      { imported: 0, errors: 2, failures: [{ path: "transcripts/codex/a.md", error: "bad" }] },
+      staged,
+    );
+    expect(result.failedSources.size).toBe(0);
+    expect(result.error).toContain("2 errors but only 1 failure paths");
+  });
+
+  it("fails closed when the structured failures field is malformed", () => {
+    const result = resolveStructuredImportFailures(
+      { imported: 0, errors: 1, failures: { path: "transcripts/codex/a.md" } },
+      staged,
+    );
+    expect(result.failedSources.size).toBe(0);
+    expect(result.error).toContain("non-array failures field");
+  });
+
+  it("advances no ingest state when GBrain reports an unmappable structured path", () => {
+    const home = makeTestHome();
+    const gstackHome = join(home, ".gstack");
+    mkdirSync(gstackHome, { recursive: true });
+    const statePath = join(gstackHome, ".transcript-ingest-state.json");
+    writeFileSync(
+      statePath,
+      JSON.stringify({ schema_version: 2, last_writer: "test", sessions: {} }),
+      "utf-8",
+    );
+    const session =
+      `{"type":"user","message":{"role":"user","content":"hi"},"timestamp":"2026-05-01T00:00:00Z","cwd":"/tmp/foo"}\n` +
+      `{"type":"assistant","message":{"role":"assistant","content":"hello"},"timestamp":"2026-05-01T00:00:01Z"}\n`;
+    writeClaudeCodeSession(home, "tmp-foo", "unmapped", session);
+    const binDir = installPortableJsonGbrain(home, {
+      status: "success",
+      imported: 0,
+      skipped: 1,
+      errors: 1,
+      failures: [{ path: "transcripts/claude-code/not-staged.md", error: "bad" }],
+    });
+
+    const r = runScript(["--bulk", "--include-unattributed", "--quiet"], {
+      HOME: home,
+      GSTACK_HOME: gstackHome,
+      PATH: `${binDir}${delimiter}${process.env.PATH || ""}`,
+    });
+    expect(r.exitCode).toBe(1);
+    expect(r.stderr).toContain("failure path could not be mapped");
+    expect(r.stderr).toContain("Refusing to advance state");
+    expect(JSON.parse(readFileSync(statePath, "utf-8")).sessions).toEqual({});
     rmSync(home, { recursive: true, force: true });
   });
 });
