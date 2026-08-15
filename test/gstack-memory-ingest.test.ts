@@ -602,6 +602,7 @@ esac
     expect(body).toContain("hello from codex rollout");
     expect(body).toContain("## Assistant");
     expect(body).toContain("codex assistant reply body");
+    expect(body).toMatch(/\n---\n## User\n/);
 
     rmSync(home, { recursive: true, force: true });
   });

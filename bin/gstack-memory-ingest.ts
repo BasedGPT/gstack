@@ -739,18 +739,18 @@ function buildTranscriptPage(path: string, session: ParsedSession): PageRecord {
   const frontmatter = [
     "---",
     `agent: ${session.agent}`,
-    `session_id: ${session.session_id}`,
-    `cwd: ${session.cwd || ""}`,
-    `git_remote: ${remote || "_unattributed"}`,
-    `start_time: ${session.start_time || ""}`,
-    `end_time: ${session.end_time || ""}`,
+    `session_id: ${JSON.stringify(session.session_id)}`,
+    `cwd: ${JSON.stringify(session.cwd || "")}`,
+    `git_remote: ${JSON.stringify(remote || "_unattributed")}`,
+    `start_time: ${JSON.stringify(session.start_time || "")}`,
+    `end_time: ${JSON.stringify(session.end_time || "")}`,
     `message_count: ${session.message_count}`,
     `tool_calls: ${session.tool_calls}`,
-    `source_path: ${path}`,
-    session.partial ? "partial: true" : "",
+    `source_path: ${JSON.stringify(path)}`,
+    ...(session.partial ? ["partial: true"] : []),
     "---",
     "",
-  ].filter((l) => l !== "").join("\n");
+  ].join("\n");
 
   return {
     slug,
