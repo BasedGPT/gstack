@@ -920,7 +920,9 @@ interface PreparedPage {
 interface StagingResult {
   staging_dir: string;
   written: number;
-  errors: Array<{ slug: string; error: string }>;
+  errors: Array<{ slug: string; source_path: string; error: string }>;
+  /** Source files that never reached staging and must not advance state. */
+  failedSources: Set<string>;
   /** Map from staging-dir-relative path (e.g. "transcripts/foo.md") → source path. */
   stagedPathToSource: Map<string, string>;
 }
@@ -950,7 +952,8 @@ export function stagedRelPath(slug: string): string {
 function writeStaged(prepared: PreparedPage[], stagingDir: string): StagingResult {
   mkdirSync(stagingDir, { recursive: true });
   const stagedPathToSource = new Map<string, string>();
-  const errors: Array<{ slug: string; error: string }> = [];
+  const errors: Array<{ slug: string; source_path: string; error: string }> = [];
+  const failedSources = new Set<string>();
   let written = 0;
   for (const p of prepared) {
     const relPath = stagedRelPath(p.slug);
@@ -961,10 +964,11 @@ function writeStaged(prepared: PreparedPage[], stagingDir: string): StagingResul
       stagedPathToSource.set(relPath, p.source_path);
       written++;
     } catch (err) {
-      errors.push({ slug: p.slug, error: (err as Error).message });
+      errors.push({ slug: p.slug, source_path: p.source_path, error: (err as Error).message });
+      failedSources.add(p.source_path);
     }
   }
-  return { staging_dir: stagingDir, written, errors, stagedPathToSource };
+  return { staging_dir: stagingDir, written, errors, failedSources, stagedPathToSource };
 }
 
 interface ImportJsonResult {
@@ -1222,6 +1226,7 @@ function preparePages(
   skippedDedup: number;
   skippedUnattributed: number;
   parseFailed: number;
+  transcriptParseFailed: number;
   partialPages: number;
 } {
   const prepared: PreparedPage[] = [];
@@ -1229,6 +1234,7 @@ function preparePages(
   let skippedDedup = 0;
   let skippedUnattributed = 0;
   let parseFailed = 0;
+  let transcriptParseFailed = 0;
   let partialPages = 0;
 
   for (const { path, type } of walkAllSources(ctx)) {
@@ -1264,6 +1270,7 @@ function preparePages(
         const session = parseTranscriptJsonl(path);
         if (!session) {
           parseFailed++;
+          transcriptParseFailed++;
           continue;
         }
         if (!args.includeUnattributed && !session.cwd) {
@@ -1281,6 +1288,7 @@ function preparePages(
       }
     } catch (err) {
       parseFailed++;
+      if (type === "transcript") transcriptParseFailed++;
       console.error(`[parse-error] ${path}: ${(err as Error).message}`);
       continue;
     }
@@ -1300,8 +1308,24 @@ function preparePages(
     skippedDedup,
     skippedUnattributed,
     parseFailed,
+    transcriptParseFailed,
     partialPages,
   };
+}
+
+function transcriptParserError(count: number): string | undefined {
+  if (count === 0) return undefined;
+  return `${count} transcript${count === 1 ? "" : "s"} could not be parsed; source state was not advanced`;
+}
+
+function stagingWriterError(count: number): string | undefined {
+  if (count === 0) return undefined;
+  return `${count} page${count === 1 ? "" : "s"} could not be staged; source state was not advanced`;
+}
+
+function combineSystemErrors(...errors: Array<string | undefined>): string | undefined {
+  const present = errors.filter((error): error is string => Boolean(error));
+  return present.length > 0 ? present.join("; ") : undefined;
 }
 
 /**
@@ -1569,6 +1593,8 @@ async function ingestPass(args: CliArgs): Promise<BulkResult> {
 
   // Phase 1: prepare (parse + secret-scan + filter + render frontmatter).
   const prep = preparePages(args, ctx, state);
+  const parserSystemError = transcriptParserError(prep.transcriptParseFailed);
+  if (parserSystemError) console.error(`[memory-ingest] ERR: ${parserSystemError}`);
 
   let written = 0;
   let failed = 0;
@@ -1604,6 +1630,7 @@ async function ingestPass(args: CliArgs): Promise<BulkResult> {
       failed: prep.parseFailed,
       duration_ms: Date.now() - t0,
       partial_pages: prep.partialPages,
+      system_error: parserSystemError,
     };
   }
 
@@ -1620,6 +1647,7 @@ async function ingestPass(args: CliArgs): Promise<BulkResult> {
       failed: prep.parseFailed,
       duration_ms: Date.now() - t0,
       partial_pages: prep.partialPages,
+      system_error: parserSystemError,
     };
   }
 
@@ -1685,13 +1713,14 @@ async function ingestPass(args: CliArgs): Promise<BulkResult> {
   // instead of deleting it (the SIGTERM forwarder's preserve branch only runs
   // when the PARENT is signalled, which an internal timeout never does).
   let preserveStaging = false;
+  let stagingSystemError: string | undefined;
   try {
     let staging: StagingResult;
     if (resuming) {
-      // Pages are already on disk from the previous run. Skip writeStaged.
-      // The "written" count for the verdict reflects what's on disk now;
-      // gbrain's import will skip already-completed entries via its own
-      // checkpoint (processedIndex+1).
+      // Candidate pages are already on disk from the previous run. Skip
+      // writeStaged, but count/map only files whose bytes still exactly match
+      // today's deterministic render; missing or stale files need a fresh pass.
+      // gbrain's import skips already-completed entries via its own checkpoint.
       if (!args.quiet) {
         console.error(
           `[memory-ingest] resuming previous staging dir ${stagingDir} (skipping prepare phase)`,
@@ -1702,14 +1731,42 @@ async function ingestPass(args: CliArgs): Promise<BulkResult> {
       // sources on resume. An empty map made every failed file fall through to
       // state-recording — i.e. silently marked ingested despite failing.
       const stagedPathToSource = new Map<string, string>();
+      const failedSources = new Set<string>();
+      const errors: StagingResult["errors"] = [];
+      let verifiedWritten = 0;
       for (const p of prep.prepared) {
-        stagedPathToSource.set(stagedRelPath(p.slug), p.source_path);
+        const relPath = stagedRelPath(p.slug);
+        const absPath = join(stagingDir, relPath);
+        let error: string | undefined;
+        try {
+          if (!existsSync(absPath)) error = "missing preserved staged file";
+          else if (!readFileSync(absPath).equals(Buffer.from(p.rendered_body, "utf-8"))) {
+            error = "preserved staged file is stale";
+          }
+        } catch (err) {
+          error = `preserved staged file could not be verified: ${(err as Error).message}`;
+        }
+        if (error) {
+          failedSources.add(p.source_path);
+          errors.push({ slug: p.slug, source_path: p.source_path, error });
+          continue;
+        }
+        stagedPathToSource.set(relPath, p.source_path);
+        verifiedWritten++;
       }
-      staging = { staging_dir: stagingDir, written: prep.prepared.length, errors: [], stagedPathToSource };
+      staging = {
+        staging_dir: stagingDir,
+        written: verifiedWritten,
+        errors,
+        failedSources,
+        stagedPathToSource,
+      };
     } else {
       staging = writeStaged(prep.prepared, stagingDir);
     }
     failed += staging.errors.length;
+    stagingSystemError = stagingWriterError(staging.errors.length);
+    if (stagingSystemError) console.error(`[memory-ingest] ERR: ${stagingSystemError}`);
     if (!args.quiet && staging.errors.length > 0) {
       for (const e of staging.errors.slice(0, 5)) {
         console.error(`[stage-error] ${e.slug}: ${e.error}`);
@@ -1742,13 +1799,14 @@ async function ingestPass(args: CliArgs): Promise<BulkResult> {
     // next gstack-brain-sync push will move it to the artifacts repo. From
     // there the brain admin's pull job indexes into the remote brain.
     //
-    // We treat ALL prepared pages as "written" since the import didn't run
-    // and we have no per-page failures from gbrain to filter on. The
-    // brain admin's pull pipeline is the authoritative gate; from this
-    // machine's perspective, the act of staging IS the write.
+    // Successfully staged pages count as "written" since the import didn't
+    // run and we have no per-page failures from gbrain to filter on. Pages
+    // whose staging write failed remain unstamped for retry. The brain admin's
+    // pull pipeline is the authoritative downstream gate.
     if (remoteHttpMode) {
       const nowIso = new Date().toISOString();
       for (const p of prep.prepared) {
+        if (staging.failedSources.has(p.source_path)) continue;
         try {
           state.sessions[p.source_path] = {
             mtime_ns: Math.floor(statSync(p.source_path).mtimeMs * 1e6),
@@ -1779,9 +1837,10 @@ async function ingestPass(args: CliArgs): Promise<BulkResult> {
         skipped_secret: prep.skippedSecret,
         skipped_dedup: prep.skippedDedup,
         skipped_unattributed: prep.skippedUnattributed,
-        failed,
+        failed: failed + prep.parseFailed,
         duration_ms: Date.now() - t0,
         partial_pages: prep.partialPages,
+        system_error: combineSystemErrors(parserSystemError, stagingSystemError),
       };
     }
 
@@ -1928,14 +1987,16 @@ async function ingestPass(args: CliArgs): Promise<BulkResult> {
         system_error: msg,
       };
     }
-    const failedSources = structuredFailures.available
+    const importFailedSources = structuredFailures.available
       ? structuredFailures.failedSources
       : readNewFailures(
           syncFailuresPath,
           preImportOffset,
           staging.stagedPathToSource,
         );
-    failed += failedSources.size;
+    failed += importFailedSources.size;
+    const failedSources = new Set(staging.failedSources);
+    for (const sourcePath of importFailedSources) failedSources.add(sourcePath);
 
     // Phase 3: state recording. Only files that landed in gbrain get
     // their mtime+sha256 stamped. Failed source paths are deliberately
@@ -2000,6 +2061,7 @@ async function ingestPass(args: CliArgs): Promise<BulkResult> {
     failed: failed + prep.parseFailed,
     duration_ms: Date.now() - t0,
     partial_pages: prep.partialPages,
+    system_error: combineSystemErrors(parserSystemError, stagingSystemError),
   };
 }
 

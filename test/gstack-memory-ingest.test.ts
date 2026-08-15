@@ -66,6 +66,15 @@ function writeCodexSession(home: string, ymd: string, content: string): string {
   return file;
 }
 
+function writeNamedCodexSession(home: string, ymd: string, name: string, content: string): string {
+  const [y, m, d] = ymd.split("-");
+  const dir = join(home, ".codex", "sessions", y, m, d);
+  mkdirSync(dir, { recursive: true });
+  const file = join(dir, `rollout-${name}.jsonl`);
+  writeFileSync(file, content, "utf-8");
+  return file;
+}
+
 function installPortableJsonGbrain(home: string, importJson: unknown): string {
   const binDir = join(home, "portable-fake-bin");
   mkdirSync(binDir, { recursive: true });
@@ -299,10 +308,12 @@ describe("gstack-memory-ingest Codex role boundary", () => {
       HOME: home,
       GSTACK_HOME: gstackHome,
     });
-    expect(r.exitCode).toBe(0);
+    expect(r.exitCode).toBe(1);
     const state = JSON.parse(readFileSync(join(gstackHome, ".transcript-ingest-state.json"), "utf-8"));
     expect(state.schema_version).toBe(2);
     expect(state.sessions).toEqual({});
+    expect(r.stderr).toContain("1 transcript could not be parsed");
+    expect(r.stderr).toContain("source state was not advanced");
     expect(r.stdout).toMatch(/written:\s+0/);
     expect(r.stdout).toMatch(/failed:\s+1/);
     rmSync(home, { recursive: true, force: true });
@@ -395,6 +406,248 @@ describe("gstack-memory-ingest structured GBrain failures", () => {
     expect(r.stderr).toContain("failure path could not be mapped");
     expect(r.stderr).toContain("Refusing to advance state");
     expect(JSON.parse(readFileSync(statePath, "utf-8")).sessions).toEqual({});
+    rmSync(home, { recursive: true, force: true });
+  });
+});
+
+describe("gstack-memory-ingest staging-write state safety", () => {
+  function writeUnstageableCodexSession(home: string): string {
+    const today = new Date();
+    const ymd = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, "0")}-${String(today.getDate()).padStart(2, "0")}`;
+    return writeCodexSession(
+      home,
+      ymd,
+      JSON.stringify({ type: "session_meta", payload: { id: "bad\u0000slug", cwd: "/tmp/stage-fail" } }) + "\n" +
+        JSON.stringify({ type: "response_item", payload: { type: "message", role: "user", content: [{ text: "valid turn" }] } }) + "\n",
+    );
+  }
+
+  it("local import does not state-stamp a source whose staging write failed", () => {
+    const home = makeTestHome();
+    const gstackHome = join(home, ".gstack");
+    mkdirSync(gstackHome, { recursive: true });
+    const failedSource = writeUnstageableCodexSession(home);
+    const binDir = installPortableJsonGbrain(home, {
+      status: "success", imported: 0, skipped: 0, errors: 0, failures: [],
+    });
+
+    const r = runScript(["--bulk", "--include-unattributed", "--quiet"], {
+      HOME: home,
+      GSTACK_HOME: gstackHome,
+      PATH: `${binDir}${delimiter}${process.env.PATH || ""}`,
+    });
+    expect(r.exitCode).toBe(1);
+    expect(r.stderr).toContain("could not be staged");
+    const state = JSON.parse(readFileSync(join(gstackHome, ".transcript-ingest-state.json"), "utf-8"));
+    expect(state.sessions[failedSource]).toBeUndefined();
+    expect(Object.keys(state.sessions)).toHaveLength(0);
+    expect(r.stdout).toMatch(/written:\s+0/);
+    expect(r.stdout).toMatch(/failed:\s+1/);
+    rmSync(home, { recursive: true, force: true });
+  });
+
+  it("remote-http staging does not state-stamp a source whose staging write failed", () => {
+    const home = makeTestHome();
+    const gstackHome = join(home, ".gstack");
+    mkdirSync(gstackHome, { recursive: true });
+    writeFileSync(
+      join(home, ".claude.json"),
+      JSON.stringify({ mcpServers: { gbrain: { type: "url", url: "https://gbrain.example/mcp" } } }),
+      "utf-8",
+    );
+    const failedSource = writeUnstageableCodexSession(home);
+    const binDir = installPortableJsonGbrain(home, {
+      status: "success", imported: 0, skipped: 0, errors: 0, failures: [],
+    });
+
+    const r = runScript(["--bulk", "--include-unattributed", "--quiet"], {
+      HOME: home,
+      GSTACK_HOME: gstackHome,
+      PATH: `${binDir}${delimiter}${process.env.PATH || ""}`,
+    });
+    expect(r.exitCode).toBe(1);
+    expect(r.stderr).toContain("could not be staged");
+    const state = JSON.parse(readFileSync(join(gstackHome, ".transcript-ingest-state.json"), "utf-8"));
+    expect(state.last_writer).toBe("gstack-memory-ingest (remote-http mode)");
+    expect(state.sessions[failedSource]).toBeUndefined();
+    expect(Object.keys(state.sessions)).toHaveLength(0);
+    expect(r.stdout).toMatch(/written:\s+0/);
+    expect(r.stdout).toMatch(/failed:\s+1/);
+    rmSync(home, { recursive: true, force: true });
+  });
+
+  it("ordinary mapped GBrain per-file failures remain retryable without a process error", () => {
+    const home = makeTestHome();
+    const gstackHome = join(home, ".gstack");
+    mkdirSync(gstackHome, { recursive: true });
+    const source = writeClaudeCodeSession(
+      home,
+      "tmp-per-file",
+      "perfile",
+      `{"type":"user","message":{"role":"user","content":"hi"},"timestamp":"2026-05-01T00:00:00Z","cwd":"/tmp/per-file"}\n`,
+    );
+    const binDir = installPortableJsonGbrain(home, {
+      status: "success",
+      imported: 0,
+      skipped: 1,
+      errors: 1,
+      failures: [{
+        path: "transcripts/claude-code/_unattributed/2026-05-01-perfile.md",
+        error: "per-file rejection",
+      }],
+    });
+
+    const r = runScript(["--bulk", "--include-unattributed", "--quiet"], {
+      HOME: home,
+      GSTACK_HOME: gstackHome,
+      PATH: `${binDir}${delimiter}${process.env.PATH || ""}`,
+    });
+    expect(r.exitCode).toBe(0);
+    const state = JSON.parse(readFileSync(join(gstackHome, ".transcript-ingest-state.json"), "utf-8"));
+    expect(state.sessions[source]).toBeUndefined();
+    expect(r.stdout).toMatch(/failed:\s+1/);
+    rmSync(home, { recursive: true, force: true });
+  });
+
+  function runResumeArtifactCase(
+    caseName: string,
+    arrangeArtifact?: (expectedPath: string) => void,
+  ): { home: string; source: string; r: ReturnType<typeof runScript>; state: any } {
+    const home = makeTestHome();
+    const gstackHome = join(home, ".gstack");
+    mkdirSync(gstackHome, { recursive: true });
+    const resumeDir = join(gstackHome, `.staging-ingest-resume-${caseName}`);
+    mkdirSync(resumeDir, { recursive: true });
+    writeFileSync(join(resumeDir, ".gstack-staging"), "test\n", "utf-8");
+    const sessionId = `resume-${caseName}`;
+    const source = writeClaudeCodeSession(
+      home,
+      "tmp-resume",
+      sessionId,
+      `{"type":"user","message":{"role":"user","content":"current body"},"timestamp":"2026-05-01T00:00:00Z","cwd":"/tmp/resume"}\n`,
+    );
+    const expectedPath = join(
+      resumeDir,
+      "transcripts",
+      "claude-code",
+      "_unattributed",
+      `2026-05-01-${sessionId.slice(0, 12)}.md`,
+    );
+    arrangeArtifact?.(expectedPath);
+    const binDir = installPortableJsonGbrain(home, {
+      status: "success", imported: 0, skipped: 0, errors: 0, failures: [],
+    });
+
+    const r = runScript(["--bulk", "--include-unattributed"], {
+      HOME: home,
+      GSTACK_HOME: gstackHome,
+      GSTACK_INGEST_RESUME_DIR: resumeDir,
+      PATH: `${binDir}${delimiter}${process.env.PATH || ""}`,
+    });
+    const state = JSON.parse(readFileSync(join(gstackHome, ".transcript-ingest-state.json"), "utf-8"));
+    return { home, source, r, state };
+  }
+
+  function expectResumeArtifactRejected(result: ReturnType<typeof runResumeArtifactCase>): void {
+    expect(result.r.exitCode).toBe(1);
+    expect(result.r.stderr).toContain("could not be staged");
+    expect(result.state.sessions[result.source]).toBeUndefined();
+    expect(result.r.stdout).toMatch(/written:\s+0/);
+    expect(result.r.stdout).toMatch(/failed:\s+1/);
+    rmSync(result.home, { recursive: true, force: true });
+  }
+
+  it("resume refuses to map or stamp a missing preserved staged artifact", () => {
+    expectResumeArtifactRejected(runResumeArtifactCase("missing"));
+  });
+
+  it("resume refuses to map or stamp a stale preserved staged artifact", () => {
+    const result = runResumeArtifactCase("stale", (expectedPath) => {
+      mkdirSync(join(expectedPath, ".."), { recursive: true });
+      writeFileSync(expectedPath, Buffer.from([0xff, 0xfe, 0x00, 0x61]));
+    });
+    expect(result.r.stderr).toContain("preserved staged file is stale");
+    expectResumeArtifactRejected(result);
+  });
+
+  it("resume refuses an unreadable preserved artifact path", () => {
+    const result = runResumeArtifactCase("unreadable", (expectedPath) => {
+      mkdirSync(expectedPath, { recursive: true });
+    });
+    expect(result.r.stderr).toContain("preserved staged file could not be verified");
+    expectResumeArtifactRejected(result);
+  });
+});
+
+describe("gstack-memory-ingest parser-drift scheduled exit policy", () => {
+  function writeValidAndInvalidCodex(home: string): { valid: string; invalid: string } {
+    const today = new Date();
+    const ymd = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, "0")}-${String(today.getDate()).padStart(2, "0")}`;
+    const valid = writeNamedCodexSession(
+      home,
+      ymd,
+      "valid-parser-path",
+      JSON.stringify({ type: "session_meta", payload: { id: "valid-parser-path", cwd: "/tmp/parser" }, timestamp: "2026-05-01T00:00:00Z" }) + "\n" +
+        JSON.stringify({ type: "response_item", payload: { type: "message", role: "user", content: [{ text: "valid" }] } }) + "\n",
+    );
+    const invalid = writeNamedCodexSession(
+      home,
+      ymd,
+      "invalid-parser-path",
+      JSON.stringify({ type: "session_meta", payload: { id: "invalid-parser-path", cwd: "/tmp/parser" }, timestamp: "2026-05-01T00:00:00Z" }) + "\n" +
+        JSON.stringify({ type: "response_item", payload: { type: "message", content: [{ text: "missing role" }] } }) + "\n",
+    );
+    return { valid, invalid };
+  }
+
+  it("local import preserves valid progress but exits nonzero for parser drift", () => {
+    const home = makeTestHome();
+    const gstackHome = join(home, ".gstack");
+    mkdirSync(gstackHome, { recursive: true });
+    const sessions = writeValidAndInvalidCodex(home);
+    const binDir = installPortableJsonGbrain(home, {
+      status: "success", imported: 1, skipped: 0, errors: 0, failures: [],
+    });
+
+    const r = runScript(["--bulk", "--include-unattributed", "--quiet"], {
+      HOME: home,
+      GSTACK_HOME: gstackHome,
+      PATH: `${binDir}${delimiter}${process.env.PATH || ""}`,
+    });
+    expect(r.exitCode).toBe(1);
+    expect(r.stderr).toContain("1 transcript could not be parsed");
+    const state = JSON.parse(readFileSync(join(gstackHome, ".transcript-ingest-state.json"), "utf-8"));
+    expect(state.sessions[sessions.valid]).toBeDefined();
+    expect(state.sessions[sessions.invalid]).toBeUndefined();
+    rmSync(home, { recursive: true, force: true });
+  });
+
+  it("remote-http preserves valid staging progress but exits nonzero for parser drift", () => {
+    const home = makeTestHome();
+    const gstackHome = join(home, ".gstack");
+    mkdirSync(gstackHome, { recursive: true });
+    writeFileSync(
+      join(home, ".claude.json"),
+      JSON.stringify({ mcpServers: { gbrain: { type: "url", url: "https://gbrain.example/mcp" } } }),
+      "utf-8",
+    );
+    const sessions = writeValidAndInvalidCodex(home);
+    const binDir = installPortableJsonGbrain(home, {
+      status: "success", imported: 0, skipped: 0, errors: 0, failures: [],
+    });
+
+    const r = runScript(["--bulk", "--include-unattributed", "--quiet"], {
+      HOME: home,
+      GSTACK_HOME: gstackHome,
+      PATH: `${binDir}${delimiter}${process.env.PATH || ""}`,
+    });
+    expect(r.exitCode).toBe(1);
+    expect(r.stderr).toContain("1 transcript could not be parsed");
+    const state = JSON.parse(readFileSync(join(gstackHome, ".transcript-ingest-state.json"), "utf-8"));
+    expect(state.last_writer).toBe("gstack-memory-ingest (remote-http mode)");
+    expect(state.sessions[sessions.valid]).toBeDefined();
+    expect(state.sessions[sessions.invalid]).toBeUndefined();
+    expect(r.stdout).toMatch(/failed:\s+1/);
     rmSync(home, { recursive: true, force: true });
   });
 });
